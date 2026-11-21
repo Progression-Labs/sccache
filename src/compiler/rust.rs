@@ -1843,7 +1843,14 @@ where
         for (var, val) in env_deps.iter() {
             var.hash(&mut HashToDigest { digest: &mut m });
             m.update(b"=");
-            val.hash(&mut HashToDigest { digest: &mut m });
+            // OUT_DIR is where Cargo put the build script's output, under the target directory:
+            // what a crate takes from there (`include!(concat!(env!("OUT_DIR"), ...))`) is in
+            // dep-info and hashed by content above. Its path is left out as `--out-dir` is, or
+            // every target directory misses on such a crate and, through the rlib's hash, on
+            // every crate that uses it (serde_core, and with it most of a dependency tree).
+            if var != "OUT_DIR" {
+                val.hash(&mut HashToDigest { digest: &mut m });
+            }
         }
         let mut env_vars: Vec<_> = env_vars
             .iter()
@@ -3895,6 +3902,38 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         });
     }
 
+    /// [`mock_dep_info`] with `# env-dep:` lines.
+    fn mock_dep_info_with_env(
+        creator: &Arc<Mutex<MockCommandCreator>>,
+        dep_srcs: &[&str],
+        env_deps: &[(&str, &str)],
+    ) {
+        let deps: Vec<String> = dep_srcs.iter().map(|s| (*s).to_string()).collect();
+        let env: Vec<(String, String)> = env_deps
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        next_command_calls(creator, move |args| {
+            let mut it = args.iter();
+            let mut dep_info_path = None;
+            while let Some(a) = it.next() {
+                if a == "-o" {
+                    dep_info_path = it.next();
+                    break;
+                }
+            }
+            let mut f = File::create(dep_info_path.unwrap())?;
+            writeln!(f, "blah: {}", deps.join(" "))?;
+            for d in deps.iter() {
+                writeln!(f, "{}:", d)?;
+            }
+            for (k, v) in env.iter() {
+                writeln!(f, "# env-dep:{}={}", k, v)?;
+            }
+            Ok(MockChild::new(exit_status(0), "", ""))
+        });
+    }
+
     fn mock_file_names(creator: &Arc<Mutex<MockCommandCreator>>, filenames: &[&str]) {
         // Mock the `rustc --print=file-names` process output.
         next_command(
@@ -4354,6 +4393,81 @@ foo.rs:
                 nothing,
                 preprocessor_cache_mode,
             )
+        );
+    }
+
+    /// The key of a compile whose dep-info names `env_deps`.
+    fn hash_key_with_env_deps(f: &TestFixture, env_deps: &[(&str, &str)]) -> String {
+        let args: Vec<OsString> = [
+            "--emit",
+            "link",
+            "foo.rs",
+            "--out-dir",
+            "out",
+            "--crate-name",
+            "foo",
+            "--crate-type",
+            "lib",
+        ]
+        .iter()
+        .map(OsString::from)
+        .collect();
+        let parsed_args = match parse_arguments(&args, f.tempdir.path()) {
+            CompilerArguments::Ok(parsed_args) => parsed_args,
+            o => panic!("Got unexpected parse result: {:?}", o),
+        };
+        f.touch("foo.rs").unwrap();
+        let mut hasher = Box::new(RustHasher {
+            executable: "rustc".into(),
+            host: "x86-64-unknown-unknown-unknown".to_owned(),
+            version: TEST_RUSTC_VERSION.to_string(),
+            sysroot: f.tempdir.path().join("sysroot"),
+            #[cfg(feature = "dist-client")]
+            target_libdir: f.tempdir.path().join("sysroot/lib/rustlib/fake-target/lib"),
+            compiler_shlibs_digests: vec![],
+            dist_archive: None,
+            #[cfg(feature = "dist-client")]
+            rlib_dep_reader: None,
+            parsed_args,
+        });
+        let creator = new_creator();
+        let runtime = single_threaded_runtime();
+        let pool = runtime.handle().clone();
+        mock_dep_info_with_env(&creator, &["foo.rs"], env_deps);
+        mock_file_names(&creator, &["foo.rlib"]);
+        hasher
+            .generate_hash_key(
+                &creator,
+                f.tempdir.path().to_owned(),
+                vec![],
+                false,
+                &pool,
+                false,
+                Arc::new(MockStorage::new(None, false)),
+                CacheControl::Default,
+            )
+            .wait()
+            .unwrap()
+            .key
+    }
+
+    #[test]
+    fn test_equal_hashes_out_dir_env_dep() {
+        let f = TestFixture::new();
+        let a = hash_key_with_env_deps(
+            &f,
+            &[("OUT_DIR", "/checkout/a/target/release/build/foo/out")],
+        );
+        let b = hash_key_with_env_deps(
+            &f,
+            &[("OUT_DIR", "/checkout/b/target/release/build/foo/out")],
+        );
+        assert_eq!(a, b, "OUT_DIR's path is not hashed");
+        // That the crate reads OUT_DIR is, and any other variable's value is.
+        assert_ne!(a, hash_key_with_env_deps(&f, &[]));
+        assert_ne!(
+            hash_key_with_env_deps(&f, &[("FOO", "/checkout/a")]),
+            hash_key_with_env_deps(&f, &[("FOO", "/checkout/b")])
         );
     }
 
