@@ -1864,10 +1864,17 @@ where
             // already uniquely identify the relevant registries.
             // CARGO_BUILD_JOBS only affects Cargo's parallelism, not rustc output.
             // CARGO_ENCODED_RUSTFLAGS is already cached in argument list
+            // CARGO_TARGET_DIR and CARGO_BUILD_TARGET_DIR only say where Cargo puts its outputs,
+            // like `--out-dir` and `-L`, which are excluded from the arguments for that reason:
+            // hashed, every target directory (every checkout or worktree that names its own) is a
+            // cache of its own. A crate that reads one at build time names it in dep-info, which
+            // is hashed above.
             if var == "CARGO_MAKEFLAGS"
                 || var.starts_with("CARGO_REGISTRIES_")
                 || var == "CARGO_BUILD_JOBS"
                 || var == "CARGO_ENCODED_RUSTFLAGS"
+                || var == "CARGO_TARGET_DIR"
+                || var == "CARGO_BUILD_TARGET_DIR"
             {
                 continue;
             }
@@ -4348,6 +4355,52 @@ foo.rs:
                 preprocessor_cache_mode,
             )
         );
+    }
+
+    #[test_case(true ; "with preprocessor cache")]
+    #[test_case(false ; "without preprocessor cache")]
+    fn test_equal_hashes_target_dir_env(preprocessor_cache_mode: bool) {
+        let f = TestFixture::new();
+        let args = &[
+            "--emit",
+            "link",
+            "foo.rs",
+            "--out-dir",
+            "out",
+            "--crate-name",
+            "foo",
+            "--crate-type",
+            "lib",
+        ];
+        let with = |vars: &[(&str, &str)]| {
+            let env: Vec<_> = vars
+                .iter()
+                .map(|(k, v)| (OsString::from(k), OsString::from(v)))
+                .collect();
+            hash_key(&f, args, &env, nothing, preprocessor_cache_mode)
+        };
+        let plain = with(&[("CARGO_PKG_NAME", "foo")]);
+        assert_eq!(
+            plain,
+            with(&[
+                ("CARGO_PKG_NAME", "foo"),
+                ("CARGO_TARGET_DIR", "/checkout/a/target")
+            ])
+        );
+        assert_eq!(
+            with(&[
+                ("CARGO_PKG_NAME", "foo"),
+                ("CARGO_TARGET_DIR", "/checkout/a/target"),
+                ("CARGO_BUILD_TARGET_DIR", "/checkout/a/target")
+            ]),
+            with(&[
+                ("CARGO_PKG_NAME", "foo"),
+                ("CARGO_TARGET_DIR", "/checkout/b/target"),
+                ("CARGO_BUILD_TARGET_DIR", "/checkout/b/target")
+            ])
+        );
+        // Other CARGO_ variables are still hashed.
+        assert_ne!(plain, with(&[("CARGO_PKG_NAME", "bar")]));
     }
 
     #[test_case(true ; "with preprocessor cache")]
